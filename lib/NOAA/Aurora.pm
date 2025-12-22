@@ -124,7 +124,8 @@ Optional parameters:
 =head2 C<get_forecast>
 
     my $forecast = $aurora->get_forecast(
-        format => $output?
+        format => $output?,
+        time   => $iso?
     );
 
 Retrieves NOAA's 3-day space forecast (preferred over the geomagnetic forecast due
@@ -132,18 +133,25 @@ to more frequent / twice daily update) and by default returns an arrayref of has
 
  [{time => $timestamp, kp => $kp_value},...]
 
+The timestamp will be at the start of the 3h time range NOAA returns.
+
 Optional parameters:
 
 =over 4
 
-=item * C<format> : If C<'text'> is specified as the format, raw text output will be returned,
+=item * C<format> : If C<'text'> is specified as the format, raw text output will be returned
+instead of an array with the timeseries.
+
+=item * C<time> : If C<'iso'> is specified, ISO 8601 (RFC 3339) will be returned
+instead of a Unix style timestamp.
 
 =back
 
 =head2 C<get_outlook>
 
     my $outlook = $aurora->get_outlook(
-        format => $output?
+        format => $output?,
+        time   => $iso?
     );
 
 Retrieves NOAA's 27-day outlook with the forecasted daily values for the 10.7cm Solar
@@ -161,7 +169,11 @@ arrayref of hashes:
 
 =over 4
 
-=item * C<format> : If C<'text'> is specified as the format, raw text output will be returned,
+=item * C<format> : If C<'text'> is specified as the format, raw text output will be returned
+instead of an array with the timeseries.
+
+=item * C<time> : If C<'iso'> is specified, ISO 8601 (RFC 3339) will be returned
+instead of a Unix style timestamp.
 
 =back
 
@@ -228,10 +240,11 @@ sub get_forecast {
     my %args = @_;
     my $url  = "$self->{swpc}/text/3-day-forecast.txt";
     my $resp = $self->_get_ua($url);
+    my $content = $resp->decoded_content || $resp->content;
 
-    return $resp->decoded_content if $args{format} && $args{format} eq 'text';
+    return $content if $args{format} && $args{format} eq 'text';
 
-    return $self->_parse_geo($resp->decoded_content);
+    return $self->_parse_geo($content, $args{time});
 }
 
 sub get_outlook {
@@ -239,8 +252,10 @@ sub get_outlook {
     my %args = @_;
 
     my $resp = $self->_get_ua("$self->{swpc}/text/27-day-outlook.txt");
-    return $resp if $args{format} && $args{format} eq 'text';;
-    return _parse_outlook($resp);
+    my $content = $resp->decoded_content || $resp->content;
+    
+    return $content if $args{format} && $args{format} eq 'text';
+    return $self->_parse_outlook($content);
 }
 
 sub kp_to_g {
@@ -298,51 +313,78 @@ sub _set_cache {
 }
 
 sub _parse_mon_day {
-    my $date = shift;
+    my $date        = shift;
     my ($mon, $day) = split /\s+/, $date;
-    my $mnum = mon_to_num($mon);
-    my ($sec, $min, $hour, $cur_day, $cur_mon, $year) = localtime();
+    $mon = mon_to_num($mon);
+    my ($sec, $min, $hour, $cur_day, $cur_mon, $year) = gmtime();
     $year += 1900;
-    $cur_mon += 1;
+    $cur_mon++;
+    
     $year += 1 if $cur_mon == 12 && $mon == 1;
     $year -= 1 if $cur_mon == 1 && $mon == 12;
-    return "$year-$mon-$day";
+    
+    return sprintf("$year-%02d-%02d", $mon, $day);
 }
 
 sub _parse_geo {
     my $self  = shift;
     my $data  = shift;
+    my $time  = shift || '';
     my @lines = split /\n/, $data;
     my $g     = qr/(?:\(G\d\)\s+)?/;
-    my (@dates, %kp_data);
-
-    while (my $curr = shift @lines) {
-        if ($curr =~ /^\s+(:?([A-Z]\w\w\s\d\d)\s*){3}/) {
+    my @dates;
+    
+    while (defined(my $line = shift @lines)) {
+        # Regex: Month Day Month Day ...
+        if ($line =~ /^\s*([A-Za-z]{3}\s+\d+)\s+([A-Za-z]{3}\s+\d+)\s+([A-Za-z]{3}\s+\d+)/) {
             @dates = map {_parse_mon_day($_)} $1, $2, $3;
             last;
         }
     }
+    
+    return [] unless @dates;
+    
+    my %kp_data;
 
     foreach my $line (@lines) {
-        if ($line =~ /^(\d{2})-\d{2}UT\s+([\d.]+)\s+$g([\d.]+)\s+$g([\d.]+)/) {
+        if ($line =~ /^\s*(\d{2})-\d{2}UT\s+([\d.]+)\s+$g([\d.]+)\s+$g([\d.]+)/) {
             my ($t, @kp) = ($1, $2, $3, $4);
             my @times = map {"$_ $t:00:00Z"} @dates;
-            # datetime_to_ts()
+            @times = map {datetime_to_ts($_)} @times unless lc($time) eq 'iso';
             $kp_data{$times[$_]} = $kp[$_] for 0..2;
         }
     }
-    return \%kp_data;
-}
-
-sub _date {
-    my $self = shift;
-    my $date = shift;
     
+    my @result = map {{time => $_, kp => $kp_data{$_}}} sort keys %kp_data;
+    return \@result;
 }
 
 sub _parse_outlook {
-    my $data = shift;
+    my ($self, $data) = @_;
+    my @lines = split /\n/, $data;
+    my @result;
     
+    foreach my $line (@lines) {
+        # Format: 2025 Mar 24     170          20          5
+        if ($line =~ /^\s*(\d{4})\s+([A-Z][a-z]{2})\s+(\d{2})\s+(\d+)\s+(\d+)\s+(\d+)/) {
+            my ($year, $mon_str, $day, $flux, $ap, $kp) = ($1, $2, $3, $4, $5, $6);
+            my $mnum = mon_to_num($mon_str) - 1;
+            
+            my $ts;
+            eval {
+                $ts = timegm(0, 0, 0, $day, $mnum, $year);
+            };
+            next if $@;
+            
+            push @result, {
+                time => $ts,
+                flux => $flux,
+                ap   => $ap,
+                kp   => $kp,
+            };
+        }
+    }
+    return \@result;
 }
 
 =head1 AUTHOR

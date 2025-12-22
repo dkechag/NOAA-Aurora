@@ -61,11 +61,16 @@ subtest 'get_forecast' => sub {
     $content = $responses[0];
     my $forecast = $aurora->get_forecast(format => 'text');
     is($request, "$base/text/3-day-forecast.txt", '3 day forecast');
-    use Data::Dumper;
     is($forecast, $responses[0], 'Raw content as expected');
+    
     $forecast = $aurora->get_forecast();
-    warn Dumper($forecast);
-    is($request, "$base/text/3-day-forecast.txt", '3 day geomag forecast');
+    is($request, "$base/text/3-day-forecast.txt", '3 day forecast');
+    ok(@$forecast > 0, 'Got entries');
+    
+    # Check first entry: Jul 03 00-03UT -> 4.67
+    my $first = $forecast->[0];
+    ok($first->{time}, 'Has time');
+    is($first->{kp}, 4.67, 'Correct Kp for first entry');
 };
 
 subtest 'get_outlook' => sub {
@@ -74,7 +79,16 @@ subtest 'get_outlook' => sub {
     my $outlook = $aurora->get_outlook(format => 'text');
     is($request, "$base/text/27-day-outlook.txt", '27 day outlook');
     is($outlook, $responses[1], 'Content as expected');
+    
     $outlook = $aurora->get_outlook();
+    ok(@$outlook > 0, 'Got entries');
+    
+    # Check first entry: 2025 Mar 24 -> Flux 170, Ap 20, Kp 5
+    my $first = $outlook->[0];
+    ok($first->{time}, 'Has time');
+    is($first->{flux}, 170, 'Correct Flux');
+    is($first->{ap}, 20, 'Correct Ap');
+    is($first->{kp}, 5, 'Correct Kp');
 };
 
 
@@ -173,4 +187,62 @@ __EOF__
 2025 Apr 17     160          10          3
 2025 Apr 18     160          12          4
 2025 Apr 19     160           8          3
+__EOF__
+:Product: 3-Day Forecast
+:Issued: 2024 Dec 31 1230 UTC
+# Prepared by the U.S. Dept. of Commerce, NOAA, Space Weather Prediction Center
+#
+A. NOAA Geomagnetic Activity Observation and Forecast
+
+The greatest observed 3 hr Kp over the past 24 hours was 2 (below NOAA
+Scale levels).
+The greatest expected 3 hr Kp for Dec 31-Jan 02 2025 is 6.67 (NOAA Scale
+G3).
+
+NOAA Kp index breakdown Dec 31-Jan 02 2025
+
+             Dec 31       Jan 01       Jan 02
+00-03UT       0.33         5.00 (G1)    2.67     
+03-06UT       0.67         3.33         2.00     
+06-09UT       2.33         4.33         2.00     
+09-12UT       1.33         3.67         2.00     
+12-15UT       5.00 (G1)    2.67         2.00     
+15-18UT       6.67 (G3)    2.33         2.00     
+18-21UT       5.33 (G1)    2.00         2.00     
+21-00UT       5.00 (G1)    3.00         2.33     
+
+Rationale: Isolated periods of G3 (Strong) geomagnetic storming are
+likely by mid to late UTC day on 31 Dec due to CME effects from a
+partial-halo event from 29 Dec. Lingering G1 (Minor) geomagnetic
+storming is likely, with a chance for G2 (Moderate) levels, on 01 Jan
+with the arrival of the second CME, also from 29 Dec.
+
+B. NOAA Solar Radiation Activity Observation and Forecast
+
+Solar radiation, as observed by NOAA GOES-18 over the past 24 hours, was
+below S-scale storm level thresholds.
+
+Solar Radiation Storm Forecast for Dec 31-Jan 02 2025
+
+              Dec 31  Jan 01  Jan 02
+S1 or greater   20%     20%     20%
+
+Rationale: A slight chance for an S1 (Minor) solar radiation storm
+event will persist through 02 Jan given the current total disk
+potential.
+
+C. NOAA Radio Blackout Activity and Forecast
+
+Radio blackouts reaching the R2 levels were observed over the past 24
+hours. The largest was at Dec 30 2024 1654 UTC.
+
+Radio Blackout Forecast for Dec 31-Jan 02 2025
+
+              Dec 31        Jan 01        Jan 02
+R1-R2           80%           80%           80%
+R3 or greater   25%           25%           25%
+
+Rationale: M-class flares are expected (R1-R2/Minor-Moderate), with a
+chance for an isolated X-class flares (R3/Strong) through 02 Jan,
+primarily due to the flare potential of Region 3936.
 __EOF__
