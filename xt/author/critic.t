@@ -10,6 +10,6 @@ unless ( $ENV{RELEASE_TESTING} ) {
     plan( skip_all => "Author tests not required for installation" );
 }
 
-critic_ok('lib/Weather/Astro7Timer.pm');
+critic_ok('lib/NOAA/Aurora.pm');
 
 done_testing;

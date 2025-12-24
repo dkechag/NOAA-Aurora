@@ -1,10 +1,11 @@
 use Test2::V0;
+use File::Temp;
 
 use HTTP::Response;
 use LWP::UserAgent;
 use NOAA::Aurora;
 
-my $aurora = NOAA::Aurora->new(swpc => 'services.swpc.noaa.gov');
+my $aurora = NOAA::Aurora->new(swpc => 'https://services.swpc.noaa.gov');
 
 my @responses = do {
     local $/ = undef;   # Slurp each section
@@ -14,16 +15,17 @@ my @responses = do {
 my $base    = 'https://services.swpc.noaa.gov';
 my $content = $responses[0];
 my $request = "";
-my $mock    = Test2::Mock->new(
+my $counter = 0;
+my $mock = Test2::Mock->new(
     class    => 'LWP::UserAgent',
     track    => 1,
     override => [
-        get =>
-            sub {
-                $request = $_[1];
-                return HTTP::Response->new(200, 'SUCCESS', undef, $content);
-                },
-    ],
+        get => sub {
+            $request = $_[1];
+            $counter++;
+            return HTTP::Response->new(200, 'SUCCESS', undef, $content);
+        }
+    ]
 );
 
 subtest 'constructor' => sub {
@@ -55,6 +57,46 @@ subtest 'get_image' => sub {
     is($img, $content, 'No cache');
 
     # Try output to temp file
+    my $tmp = File::Temp->new();
+    my $fname = $tmp->filename;
+    close($tmp); # Just need the name, method opens it
+
+    $aurora->get_image(output => $fname);
+    ok(-e $fname, 'File created');
+
+    # Read back
+    open(my $fh, '<', $fname);
+    my $data = do { local $/; <$fh> };
+    close($fh);
+    is($data, $content, 'File content correct');
+    unlink $fname;
+};
+
+subtest 'get_probability' => sub {
+    $content = '{"coordinates":[[0,0,50], [10,15,60]]}';
+    $aurora = NOAA::Aurora->new();
+
+    my $cnt = $counter;
+    my $prob = $aurora->get_probability();
+    is($prob, '{"coordinates":[[0,0,50], [10,15,60]]}', 'Got JSON string');
+    is($counter, $cnt+1, 'Fetched fresh results');
+
+    $prob = $aurora->get_probability(hash => 1);
+    is($prob, {0=>{0=>50},10=>{15=>60}}, 'Got Hash');
+
+    my $val = $aurora->get_probability(lat => 0, lon => 0);
+    is($val, 50, 'Got specific value');
+
+    $val = $aurora->get_probability(lat => 15, lon => 10);
+    is($val, 60, 'Got another specific value');
+
+    $val = $aurora->get_probability(lat => 15.4, lon => 9.8);
+    is($val, 60, 'Float is OK');
+
+    $val = $aurora->get_probability(lat => 50, lon => 50);
+    is($val, 0, 'Got zero for unknown location');
+
+    is($counter, $cnt+1, 'No further fetches');
 };
 
 subtest 'get_forecast' => sub {
@@ -167,9 +209,10 @@ subtest 'get_forecast' => sub {
         ],
         'Forecast correct'
     );
-    
+
     $content = $responses[2];
-    $forecast = $aurora->get_forecast(time => 'iso');
+    $aurora = NOAA::Aurora->new(date_format => 'rfc');
+    $forecast = $aurora->get_forecast();
     is(
         $forecast,
         [{
@@ -269,9 +312,8 @@ subtest 'get_forecast' => sub {
                 'time' => '2025-01-02 21:00:00Z'
             }
         ],
-        'Correct forecast with ISO times'
+        'Correct forecast with RFC times'
     );
-
 };
 
 subtest 'get_outlook' => sub {
@@ -281,6 +323,7 @@ subtest 'get_outlook' => sub {
     is($request, "$base/text/27-day-outlook.txt", '27 day outlook');
     is($outlook, $responses[1],                   'Content as expected');
 
+    $aurora = NOAA::Aurora->new();
     $outlook = $aurora->get_outlook();
     is(
         $outlook,
@@ -450,9 +493,8 @@ subtest 'get_outlook' => sub {
         'Corrent outlook entries'
     );
 
-    # ISO Time test
+    $aurora = NOAA::Aurora->new(date_format => 'iso');
     my $iso_o = $aurora->get_outlook(
-        time   => 'iso',
         format => 'none'
     );
     like(
@@ -461,7 +503,7 @@ subtest 'get_outlook' => sub {
             'kp'   => '5',
             'flux' => '170',
             'ap'   => '20',
-            'time' => '2025-03-24 00:00:00Z'
+            'time' => '2025-03-24T00:00:00Z'
         },
         'Got ISO time match'
     );

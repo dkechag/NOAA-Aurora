@@ -4,9 +4,6 @@ use 5.006;
 use strict;
 use warnings;
 
-use Carp;
-use Time::Local;
-
 use parent 'Weather::API::Base';
 use Weather::API::Base qw(:all);
 
@@ -22,7 +19,8 @@ our $VERSION = '0.1';
 
   use NOAA::Aurora;
 
-  my $aurora = NOAA::Aurora->new();
+  # Constructor can use RFC 3339 or ISO instead of timestamps for timeseries
+  my $aurora = NOAA::Aurora->new(date_format => 'rfc');
 
   # Save the latest probability map to an image file
   $aurora->get_image(hemisphere => 'north', output => 'aurora_north.jpg');
@@ -43,7 +41,7 @@ Aurora Forecast API. This service provides real-time aurora forecasts based on s
 
 The module fetches aurora probability data, latest aurora images, and the 3-day aurora forecast.
 
-Responses are cached by default.
+Responses are cached (by default for 120 sec).
 
 =head1 CONSTRUCTOR
 
@@ -52,7 +50,7 @@ Responses are cached by default.
     my $aurora = NOAA::Aurora->new(
         cache       => $cache_secs?,
         swpc        => $swpc_services_subdomain,
-        date_format => $unix_or_iso,
+        date_format => $unix_rfc_or_iso,
         timeout     => $timeout_sec?,
         agent       => $user_agent_string?,
         ua          => $lwp_ua?,
@@ -67,7 +65,8 @@ Optional parameters:
 =item * C<swpc> : Space Weather Prediction Center subdomain. Default: C<services.swpc.noaa.gov>.
 
 =item * C<date_format> : Format for functions that return dates/timestamps.
-Can be C<unix> (unix timestamp), C<iso> (for I<YYYY-MM-DDTHH:mmssZ>) or C<rfc> (like iso but space as date/time delimiter). Default: C<unix>.
+Can be C<unix> (unix timestamp), C<rfc> (for I<YYYY-MM-DD HH:mm:ssZ>) or C<iso> (for I<YYYY-MM-DDTHH:mm:ssZ>).
+Default: C<unix>.
 
 =item * C<timeout> : Timeout for requests in secs. Default: C<30>.
 
@@ -109,29 +108,38 @@ Optional parameters:
     );
 
 Fetches the aurora probability at a specific latitude and longitude if specified,
-otherwise will return all the globe. Probability given as a percentage (0-100).
-Function caches the results (see constructor).
+otherwise will return all the globe. Can return the original NOAA JSON string, or
+decode it into a Perl hash of hashes:
+
+    {
+        $longitude1 => {$latitude1 => $prob},
+        ...
+    }
+
+Probability given as an integer percentage value (0-100). Granularity is 1 degree.
+In Perl hash mode, 0 probability locations will be ommitted from the response.
+
+The function caches the results (see constructor), so subsequent calls will not
+require downloading and decoding.
 
 Optional parameters:
 
 =over 4
 
-=item * C<perlhash> : If true, will return Perl hash instead of JSON.
+=item * C<hash> : If true, will return Perl hash instead of JSON.
 
 =back
-
 
 =head2 C<get_forecast>
 
     my $forecast = $aurora->get_forecast(
-        format => $output?,
-        time   => $iso?
+        format => $output?
     );
 
 Retrieves NOAA's 3-day space forecast (preferred over the geomagnetic forecast due
 to more frequent / twice daily update) and by default returns an arrayref of hashes:
 
- [{time => $timestamp, kp => $kp_value},...]
+    [{time => $timestamp, kp => $kp_value},...]
 
 The timestamp will be at the start of the 3h time range NOAA returns.
 
@@ -142,16 +150,12 @@ Optional parameters:
 =item * C<format> : If C<'text'> is specified as the format, raw text output will be returned
 instead of an array with the timeseries.
 
-=item * C<time> : If C<'iso'> is specified, ISO 8601 (RFC 3339) will be returned
-instead of a Unix style timestamp.
-
 =back
 
 =head2 C<get_outlook>
 
     my $outlook = $aurora->get_outlook(
-        format => $output?,
-        time   => $iso?
+        format => $output?
     );
 
 Retrieves NOAA's 27-day outlook with the forecasted daily values for the 10.7cm Solar
@@ -160,10 +164,10 @@ arrayref of hashes:
 
  [
    {
-     $time => $timestamp,
-     flux  => $flux_value,
-     ap    => $a_index,
-     kp    => $max_kp_value
+     time => $timestamp,
+     flux => $flux_value,
+     ap   => $a_index,
+     kp   => $max_kp_value
    }, ...
  ]
 
@@ -171,9 +175,6 @@ arrayref of hashes:
 
 =item * C<format> : If C<'text'> is specified as the format, raw text output will be returned
 instead of an array with the timeseries.
-
-=item * C<time> : If C<'iso'> is specified, ISO 8601 (RFC 3339) will be returned
-instead of a Unix style timestamp.
 
 =back
 
@@ -184,7 +185,8 @@ instead of a Unix style timestamp.
     my $g_index = kp_to_g($kp_index);
 
 Pass the Kp index and get the G-Index (Geomagnetic storm from G1 to G5) or 0 if
-the Kp is not indicative of a Geomagnetic Storm.
+the Kp is not indicative of a Geomagnetic Storm. Fractional kp is rounded half up
+(e.g. kp >= 4.5 -> G1).
 
 =cut
 
@@ -193,8 +195,14 @@ sub new {
 
     my $self = $class->SUPER::new(%args);
 
+    $self->{data}  = {};
     $self->{cache} = $args{cache} // 120;
     $self->{swpc}  = $args{swpc}  || 'services.swpc.noaa.gov';
+    $self->{swpc} =~ s#^http(?:s)?://##;
+    # Time delimiter for rfc/iso
+    my $time_f  = lc($args{date_format} || '');
+    $self->{td} = ' ' if $time_f eq 'rfc';
+    $self->{td} = 'T' if $time_f eq 'iso';
 
     return $self;
 }
@@ -204,16 +212,18 @@ sub get_image {
     my %args = @_;
     $args{hem} ||= $args{hemisphere} || '';
 
-    my $h    = $args{hem} =~/^s/i ? 'south' : 'north';
-    my $resp = $self->_get_cache($h);
-    $resp ||= $self->_set_cache(
-        $h, $self->_get_ua("$self->{swpc}/images/animations/ovation/$h/latest.jpg")
+    my $h    = $args{hem} =~ /^s/i ? 'south' : 'north';
+    my $data = $self->_get_cache($h) || $self->_set_cache(
+        $h,
+        $self->_get_output(
+            $self->_get_ua(
+                "$self->{swpc}/images/animations/ovation/$h/latest.jpg"
+            )
+        )
     );
 
-    my $data = $self->_get_output($resp);
-
     if ($args{output}) {
-          open(my $fh, '>', $args{output}) or die $!;
+          open(my $fh, '>:raw', $args{output}) or die $!;
           print $fh $data;
           close($fh);
     }
@@ -228,8 +238,9 @@ sub get_probability {
     my ($json, $hash) = $self->_get_probabilities;
 
     if (defined $args{lat} && defined $args{lon}) {
+        $args{$_} = sprintf("%.0f", $args{$_}) for qw/lat lon/;
         Weather::API::Base::_verify_lat_lon(\%args);
-        return $hash->{lon}->{lat} || 0;
+        return $hash->{$args{lon}}->{$args{lat}} || 0;
     }
 
     return $args{hash} ? $hash : $json;
@@ -245,10 +256,9 @@ sub _get_text_source {
 
     return $content if $args{format} && $args{format} eq 'text';
 
-    my @args = ($content, lc($args{time} || ''));
     return $source eq '3-day-forecast'
-        ? $self->_parse_geo(@args)
-        : $self->_parse_outlook(@args);
+        ? $self->_parse_geo($content)
+        : $self->_parse_outlook($content);
 }
 
 sub get_forecast {
@@ -273,7 +283,6 @@ sub kp_to_g {
 
 sub _get_probabilities {
     my $self = shift;
-
     my $json = $self->_get_cache('json');
     my $hash = $self->_get_cache('hash');
     return ($json, $hash) if $json && $hash;
@@ -283,14 +292,15 @@ sub _get_probabilities {
 sub _refresh_probability {
     my $self = shift;
     my $resp = $self->_get_ua("$self->{swpc}/json/ovation_aurora_latest.json");
-    my %json = $self->_get_output($resp, 1);
-    $self->_set_cache('json', \%json);
+    my $json = $resp->decoded_content;
+    my %raw  = $self->_get_output($resp, 1);
+    $self->_set_cache('json', $json);
     my %hash;
-    foreach (@{$json{coordinates}}) {
+    foreach (@{$raw{coordinates}}) {
         $hash{$_->[0]}->{$_->[1]} = $_->[2] if $_->[2];
     }
     $self->_set_cache('hash', \%hash);
-    return (\%json, \%hash);
+    return ($json, \%hash);
 }
 
 sub _get_cache {
@@ -315,7 +325,6 @@ sub _set_cache {
     return $data;
 }
 
-
 # Parse from last day to first, passing ref_month being the last month processed
 sub _parse_mon_day {
     my ($date, $ref_year, $ref_mon) = @_;
@@ -329,7 +338,7 @@ sub _parse_mon_day {
 }
 
 sub _parse_geo {
-    my ($self, $data , $time) = @_;
+    my ($self, $data) = @_;
     my @lines = split /\n/, $data;
     my $g     = qr/(?:\(G\d\)\s+)?/;
     
@@ -341,6 +350,8 @@ sub _parse_geo {
              last;
          }
     }
+
+    return [] unless $year;
 
     # Date headers
     my @dates;
@@ -356,11 +367,12 @@ sub _parse_geo {
     return [] unless @dates;
 
     my %kp_data;
+    my $td = $self->{td} || ' ';
     foreach my $line (@lines) {
         if ($line =~ /^\s*(\d{2})-\d{2}UT\s+([\d.]+)\s+$g([\d.]+)\s+$g([\d.]+)/) {
             my ($t, @kp) = ($1, $2, $3, $4);
-            my @times = map {"$_ $t:00:00Z"} @dates;
-            @times = map {datetime_to_ts($_)} @times unless lc($time) eq 'iso';
+            my @times = map {"$_$td$t:00:00Z"} @dates;
+            @times = map {datetime_to_ts($_)} @times unless $self->{td};
             $kp_data{$times[$_]} = $kp[$_] for 0..2;
         }
     }
@@ -370,17 +382,18 @@ sub _parse_geo {
 }
 
 sub _parse_outlook {
-    my ($self, $data, $time) = @_;
+    my ($self, $data) = @_;
     my @lines = split /\n/, $data;
     my @result;
 
+    my $td = $self->{td} || ' ';
     foreach my $line (@lines) {
         if ($line =~ /^\s*(\d{4})\s+([A-Z][a-z]{2})\s+(\d{2})\s+(\d+)\s+(\d+)\s+(\d+)/) {
             my ($year, $mon_str, $day, $flux, $ap, $kp) = ($1, $2, $3, $4, $5, $6);
             my $mnum = mon_to_num($mon_str);
             
-            my $dt = sprintf("$year-%02d-%02d 00:00:00Z", $mnum, $day);
-            my $ts = (lc($time||'') eq 'iso') ? $dt : datetime_to_ts($dt);
+            my $dt = sprintf("$year-%02d-%02d${td}00:00:00Z", $mnum, $day);
+            my $ts = $self->{td} ? $dt : datetime_to_ts($dt);
             
             push @result, {
                 time => $ts,
@@ -401,8 +414,6 @@ Dimitrios Kechagias, C<< <dkechag at cpan.org> >>
 
 Please report any bugs or feature requests either on L<GitHub|https://github.com/dkechag/NOAA-Aurora> (preferred), or on RT (via the email
 C<bug-noaa-aurora at rt.cpan.org> or L<web interface|https://rt.cpan.org/NoAuth/ReportBug.html?Queue=NOAA-Aurora>).
-
-I will be notified, and then you'll automatically be notified of progress on your bug as I make changes.
 
 =head1 GIT
 
